@@ -16,6 +16,7 @@
 // ----------------------------------------------------------------------------
 // Transformer model
 
+// Config
 typedef struct {
     int dim; // transformer dimension
     int hidden_dim; // for ffn layers
@@ -60,10 +61,11 @@ typedef struct {
     float *att; // buffer for scores/attention values (n_heads, seq_len)
     float *logits; // output logits
     // kv cache
-    float* key_cache;   // (layer, seq_len, dim)
+    float* key_cache;   // (layer, seq_len, dim) 这里dim应该是kv_dim?
     float* value_cache; // (layer, seq_len, dim)
 } RunState;
 
+// 用来加载模型的权重，运行时配置的超参，保存模型运行的状态
 typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
     TransformerWeights weights; // the weights of the model
@@ -76,6 +78,8 @@ typedef struct {
 
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
+    // 为runstate结构申请内存
+    // 这里没有为*k, *v指针申请内存，因为k,v指针之后直接指向k/v_cache的空间
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     s->x = calloc(p->dim, sizeof(float));
     s->xb = calloc(p->dim, sizeof(float));
@@ -108,6 +112,9 @@ void free_run_state(RunState* s) {
     free(s->value_cache);
 }
 
+// Transformer模型的权重映射保存到TransformerWeights结构体中
+// 每个结构体的成员存储了多个layter的参数,这样排布似乎没有充分利用Cache
+// TODO:改为每层的参数连续可能可以使用滑动窗口节省内存
 void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
     int head_size = p->dim / p->n_heads;
     // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
@@ -139,6 +146,7 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
+// 读取模型文件(checkpoint), 使用mmap映射到内存区域
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
                      int* fd, float** data, ssize_t* file_size) {
     FILE *file = fopen(checkpoint, "rb");
@@ -157,8 +165,8 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    float* weights_ptr = *data + sizeof(Config)/sizeof(float);
-    memory_map_weights(weights, config, weights_ptr, shared_weights);
+    float* weights_ptr = *data + sizeof(Config)/sizeof(float);  // 跳过checkpoint文件的Conifg部分
+    memory_map_weights(weights, config, weights_ptr, shared_weights); // 将映射后的权重参数保存到数据结构中
 }
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
@@ -179,6 +187,7 @@ void free_transformer(Transformer* t) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
+// o是output, x是输入,weight是权重参数,size是x的维度
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
     float ss = 0.0f;
@@ -218,11 +227,12 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
+    // openMP并行
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
+            val += w[i * n + j] * x[j];  // w是一维数组表示二维矩阵
         }
         xout[i] = val;
     }
@@ -236,13 +246,16 @@ float* forward(Transformer* transformer, int token, int pos) {
     RunState* s = &transformer->state;
     float *x = s->x;
     int dim = p->dim;
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    // TODO:kv_dim为什么这样算？
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads; // 这里的意义是什么？kv_dim < dim?
     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
-    int hidden_dim =  p->hidden_dim;
+    int hidden_dim =  p->hidden_dim;  // 隐藏层维度具体是哪里？
     int head_size = dim / p->n_heads;
 
     // copy the token embedding into x
-    float* content_row = w->token_embedding_table + token * dim;
+    // x是词嵌入向量
+    // token是词嵌入在table中的下标, table是一维数组，这里通过下标找到了嵌入向量的偏移
+    float* content_row = w->token_embedding_table + token * dim; 
     memcpy(x, content_row, dim*sizeof(*x));
 
     // forward all the layers
@@ -252,11 +265,13 @@ float* forward(Transformer* transformer, int token, int pos) {
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
         // key and value point to the kv cache
+        // loff是Layer offset的意思，看来框架分配了最大长度(seqlen)的kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
         s->k = s->key_cache + loff + pos * kv_dim;
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
+        // 计算qkv
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
@@ -369,6 +384,7 @@ typedef struct {
     int id;
 } TokenIndex;
 
+// 保存词对应的token，还有token的最大长度
 typedef struct {
     char** vocab;
     float* vocab_scores;
