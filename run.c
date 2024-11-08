@@ -27,6 +27,7 @@ typedef struct {
     int seq_len; // max sequence length
 } Config;
 
+// TODO:排布可以改一下适应cache
 typedef struct {
     // token embedding table
     float* token_embedding_table;    // (vocab_size, dim)
@@ -50,8 +51,8 @@ typedef struct {
 
 typedef struct {
     // current wave of activations
-    float *x; // activation at current time stamp (dim,)
-    float *xb; // same, but inside a residual branch (dim,)
+    float *x; // activation at current time stamp (dim,),x是输入的原值
+    float *xb; // same, but inside a residual branch (dim,),xb保存实际forward的计算结果
     float *xb2; // an additional buffer just for convenience (dim,)
     float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
     float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
@@ -238,6 +239,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
+// 前向传播过程，包含完整的layer
 float* forward(Transformer* transformer, int token, int pos) {
 
     // a few convenience variables
@@ -277,6 +279,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
+        // RoPE是成对赋值的,所以i+=2
         for (int i = 0; i < dim; i+=2) {
             int head_dim = i % head_size;
             float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
@@ -295,10 +298,10 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // multihead attention. iterate over all heads
         int h;
-        #pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads; h++) {
+        #pragma omp parallel for private(h)  // 多个头并行处理
+        for (h = 0; h < p->n_heads; h++) {  // 迭代多头
             // get the query vector for this head
-            float* q = s->q + h * head_size;
+            float* q = s->q + h * head_size; // 每次q的偏移量为当前头数
             // attention scores for this head
             float* att = s->att + h * p->seq_len;
             // iterate over all timesteps, including the current one
@@ -307,7 +310,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                 float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
                 // calculate the attention score as the dot product of q and k
                 float score = 0.0f;
-                for (int i = 0; i < head_size; i++) {
+                for (int i = 0; i < head_size; i++) {  // 只计算当前头的qk
                     score += q[i] * k[i];
                 }
                 score /= sqrtf(head_size);
@@ -334,9 +337,11 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the attention
+        // 这里对应softmax后的线性层
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
+        // 残差和
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb2[i];
         }
@@ -369,6 +374,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     }
 
     // final rmsnorm
+    // 所有layer计算结束后的RMSNorm
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
@@ -378,22 +384,24 @@ float* forward(Transformer* transformer, int token, int pos) {
 
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
+// 字节对编码（BPE）分词器
 
 typedef struct {
     char *str;
     int id;
 } TokenIndex;
 
-// 保存词对应的token，还有token的最大长度
+// 分词器结构
 typedef struct {
     char** vocab;
-    float* vocab_scores;
+    float* vocab_scores;   // scores用来记录什么？
     TokenIndex *sorted_vocab;
     int vocab_size;
     unsigned int max_token_length;
     unsigned char byte_pieces[512]; // stores all single-byte strings
 } Tokenizer;
 
+// 比较tokens的str，用于排序？
 int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
@@ -410,11 +418,12 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
         t->byte_pieces[i * 2 + 1] = '\0';
     }
     // read in the file
+    // 分词器文件存在哪？
     FILE *file = fopen(tokenizer_path, "rb");
     if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer_path); exit(EXIT_FAILURE); }
     if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
     int len;
-    for (int i = 0; i < vocab_size; i++) {
+    for (int i = 0; i < vocab_size; i++) {  // 读进来的是词汇str吗？
         if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);}
         if (fread(&len, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
         t->vocab[i] = (char *)malloc(len + 1);
@@ -465,6 +474,7 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     return res != NULL ? res->id : -1;
 }
 
+// 将文本编码为token?
 void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
@@ -587,6 +597,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 }
 
 // ----------------------------------------------------------------------------
+// 采样器
 // The Sampler, which takes logits and returns a sampled token
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
@@ -695,6 +706,7 @@ void free_sampler(Sampler* sampler) {
     free(sampler->probindex);
 }
 
+// 使用xorshift生成伪随机数
 unsigned int random_u32(unsigned long long *state) {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
     *state ^= *state >> 12;
@@ -745,6 +757,7 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
+// steps规定最长生成token长度
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
@@ -771,6 +784,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         // advance the state machine
         if (pos < num_prompt_tokens - 1) {
             // if we are still processing the input prompt, force the next prompt token
+            // prompt的forward浪费了？
             next = prompt_tokens[pos + 1];
         } else {
             // otherwise sample the next token from the logits
@@ -788,6 +802,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         token = next;
 
         // init the timer here because the first iteration can be slower
+        // 因为第一次需要加载模型
         if (start == 0) { start = time_in_ms(); }
     }
     printf("\n");
@@ -937,6 +952,7 @@ int main(int argc, char *argv[]) {
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
+    // 每次解析flag + 实际arg的形式(如-x xxx)，因此步长为二
     for (int i = 2; i < argc; i+=2) {
         // do some basic validation
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
