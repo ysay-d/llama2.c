@@ -603,6 +603,7 @@ typedef struct {
     unsigned long long rng_state;
 } Sampler;
 
+// 贪婪采样,probabilities是未排序的概率数组
 int sample_argmax(float* probabilities, int n) {
     // return the index that has the highest probability
     int max_i = 0;
@@ -616,6 +617,7 @@ int sample_argmax(float* probabilities, int n) {
     return max_i;
 }
 
+// cdf(累计概率)大于coin时采样(随机采样)
 int sample_mult(float* probabilities, int n, float coin) {
     // sample index from probabilities (they must sum to 1!)
     // coin is a random number in [0, 1), usually from random_f32()
@@ -704,6 +706,7 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
+// 返回的next是在词汇表中的下标(也就是token)
 int sample(Sampler* sampler, float* logits) {
     // sample the token given the logits and some hyperparameters
     int next;
@@ -712,7 +715,7 @@ int sample(Sampler* sampler, float* logits) {
         next = sample_argmax(logits, sampler->vocab_size);
     } else {
         // apply the temperature to the logits
-        for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
+        for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; } // logits/temprature用于缩放概率
         // apply softmax to the logits to get the probabilities for next token
         softmax(logits, sampler->vocab_size);
         // flip a (float) coin (this is our source of entropy for sampling)
