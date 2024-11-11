@@ -251,7 +251,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     // TODO:kv_dim为什么这样算？
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads; // 这里的意义是什么？kv_dim < dim?
     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
-    int hidden_dim =  p->hidden_dim;  // 隐藏层维度具体是哪里？
+    int hidden_dim =  p->hidden_dim;  // 隐藏层维度具体是哪里->FFN层的维度
     int head_size = dim / p->n_heads;
 
     // copy the token embedding into x
@@ -260,7 +260,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     float* content_row = w->token_embedding_table + token * dim; 
     memcpy(x, content_row, dim*sizeof(*x));
 
-    // forward all the layers
+    // forward all the layers,每层一个循环
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
         // attention rmsnorm
@@ -273,7 +273,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
-        // 计算qkv
+        // linear，计算qkv
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
@@ -299,7 +299,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         // multihead attention. iterate over all heads
         int h;
         #pragma omp parallel for private(h)  // 多个头并行处理
-        for (h = 0; h < p->n_heads; h++) {  // 迭代多头
+        for (h = 0; h < p->n_heads; h++) {  // 迭代多个头
             // get the query vector for this head
             float* q = s->q + h * head_size; // 每次q的偏移量为当前头数
             // attention scores for this head
@@ -307,6 +307,7 @@ float* forward(Transformer* transformer, int token, int pos) {
             // iterate over all timesteps, including the current one
             for (int t = 0; t <= pos; t++) {
                 // get the key vector for this head and at this timestep
+                // h / kv_mul即MQA，一个kv_mul内的q共享一组kv cache
                 float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
                 // calculate the attention score as the dot product of q and k
                 float score = 0.0f;
